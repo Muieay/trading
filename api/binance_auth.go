@@ -9,11 +9,12 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"trading/config"
 )
 
-const (
-	BaseURL = "https://demo-api.binance.com"
-)
+// BaseURL 将根据配置动态设置
+var BaseURL = "https://demo-api.binance.com"
 
 // BinanceClient Binance API 客户端
 type BinanceClient struct {
@@ -85,21 +86,23 @@ func executeRequest(client *http.Client, req *http.Request) ([]byte, int, error)
 // ============================================================
 
 func PrintBinanceAuth() {
-	apiKey := os.Getenv("BINANCE_API_KEY")
-	secretKey := os.Getenv("BINANCE_SECRET_KEY")
-
-	if apiKey == "" || secretKey == "" {
-		fmt.Println("⚠️  请设置环境变量 BINANCE_API_KEY 和 BINANCE_SECRET_KEY")
-		fmt.Println("   export BINANCE_API_KEY=your_api_key")
-		fmt.Println("   export BINANCE_SECRET_KEY=your_secret_key")
+	// 从配置文件加载API密钥
+	appConfig, err := config.LoadConfig()
+	if err != nil {
+		fmt.Printf("❌ 加载配置失败: %v\n", err)
+		fmt.Println("💡 请先运行 'bt connect' 命令配置API密钥")
 		os.Exit(1)
 	}
 
-	client := NewBinanceClient(apiKey, secretKey)
+	// 设置BaseURL
+	BaseURL = appConfig.BaseURL
+
+	client := NewBinanceClient(appConfig.APIKey, appConfig.SecretKey)
 
 	fmt.Println("🔐 Binance API 鉴权测试")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Printf("📡 请求地址: %s/api/v3/account\n", BaseURL)
+	fmt.Printf("🌐 网络类型: %s\n", getNetworkType(BaseURL))
 	fmt.Printf("🕐 请求时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -143,4 +146,16 @@ func PrintBinanceAuth() {
 		fmt.Println("   │ （暂无非零资产）                                           │")
 	}
 	fmt.Println("   └─────────────┴──────────────────────┴──────────────────────┘")
+}
+
+// getNetworkType 根据BaseURL返回网络类型
+func getNetworkType(baseURL string) string {
+	switch baseURL {
+	case "https://api.binance.com":
+		return "现货网络 (Spot Network)"
+	case "https://demo-api.binance.com":
+		return "模拟网络 (Demo Network)"
+	default:
+		return "未知网络"
+	}
 }

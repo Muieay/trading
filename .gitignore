@@ -21,6 +21,7 @@
 # Build outputs
 *.exe
 *.out
+.bt/
 
 # Test outputs
 *.md
