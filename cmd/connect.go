@@ -1,8 +1,4 @@
-/*
-Copyright © 2026 LogicApex
-
-Binance 连接配置命令
-*/
+// Package cmd /*
 package cmd
 
 import (
