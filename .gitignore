@@ -1,0 +1,36 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+# 基于编辑器的 HTTP 客户端请求
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+
+
+# IDE
+.idea
+.vscode
+.trae
+.cursor
+.kiro
+.qoder
+*.swp
+*.swo
+
+# Build outputs
+*.exe
+*.out
+
+# Test outputs
+*.md
+!README.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.test
+*.prof
+coverage.out
