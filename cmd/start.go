@@ -2,10 +2,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,6 +78,8 @@ func runStart(cmd *cobra.Command, args []string) {
 	switch strategyConfig.Type {
 	case StrategyPureMarketMaking:
 		strategyRunner, err = createPureMarketMakingStrategy(client, strategyConfig.Params)
+	case StrategyWaitMarketMaking:
+		strategyRunner, err = createWaitMarketMakingStrategy(client, strategyConfig.Params)
 	default:
 		err = fmt.Errorf("不支持的策略类型: %s", strategyConfig.Type)
 	}
@@ -105,11 +109,130 @@ func runStart(cmd *cobra.Command, args []string) {
 	waitForInterrupt(strategyRunner)
 }
 
+// ============================================================
+// StrategyRunner 接口
+// ============================================================
+
 // StrategyRunner 策略运行器接口
 type StrategyRunner interface {
 	Start() error
 	Stop() error
 	GetStatus() map[string]interface{}
+}
+
+// ============================================================
+// WaitMarketRunner —— WaitMarketStrategy 的 StrategyRunner 适配器
+// ============================================================
+
+// WaitMarketRunner 将 strategy.WaitMarketStrategy 包装为 StrategyRunner。
+// WaitMarketStrategy.Run(ctx) 是阻塞循环，适配器在独立 goroutine 中运行它，
+// 通过 context 取消实现优雅退出。
+type WaitMarketRunner struct {
+	inner  *strategy.WaitMarketStrategy
+	params map[string]interface{} // 保存原始参数，用于 GetStatus
+
+	mu      sync.RWMutex
+	running bool
+	cancel  context.CancelFunc
+	done    chan struct{} // Run 返回后关闭
+	runErr  error         // Run 返回的错误（如有）
+}
+
+// Start 在后台 goroutine 中启动策略主循环。
+func (r *WaitMarketRunner) Start() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.running {
+		return fmt.Errorf("策略已在运行中")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
+	r.done = make(chan struct{})
+	r.running = true
+
+	go func() {
+		defer close(r.done)
+		if err := r.inner.Run(ctx); err != nil {
+			r.mu.Lock()
+			r.runErr = err
+			r.mu.Unlock()
+			fmt.Printf("❌ 策略运行出错: %v\n", err)
+		}
+		r.mu.Lock()
+		r.running = false
+		r.mu.Unlock()
+	}()
+
+	return nil
+}
+
+// Stop 发出取消信号并等待策略主循环退出（最多 30 秒）。
+func (r *WaitMarketRunner) Stop() error {
+	r.mu.Lock()
+	if !r.running {
+		r.mu.Unlock()
+		return nil
+	}
+	cancel := r.cancel
+	done := r.done
+	r.mu.Unlock()
+
+	cancel() // 触发 ctx.Done()
+
+	// 等待 Run goroutine 退出
+	select {
+	case <-done:
+		fmt.Println("✅ 挂单做市策略已停止")
+	case <-time.After(30 * time.Second):
+		fmt.Println("⚠️  等待策略退出超时（30s），强制终止")
+	}
+
+	r.mu.RLock()
+	err := r.runErr
+	r.mu.RUnlock()
+	return err
+}
+
+// GetStatus 返回策略当前的运行快照，供状态打印使用。
+func (r *WaitMarketRunner) GetStatus() map[string]interface{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	status := map[string]interface{}{
+		"running":  r.running,
+		"strategy": "wait_market_making",
+		"market":   getStringParam(r.params, "market", ""),
+	}
+	return status
+}
+
+// ============================================================
+// 工厂函数
+// ============================================================
+
+// createWaitMarketMakingStrategy 解析参数、构造 WaitMarketStrategy 并包装为 StrategyRunner。
+func createWaitMarketMakingStrategy(client *api.BinanceClient, params map[string]interface{}) (StrategyRunner, error) {
+	inner, err := strategy.NewWaitMarketStrategy(client, params)
+	if err != nil {
+		return nil, fmt.Errorf("创建挂单做市策略失败: %w", err)
+	}
+
+	// 打印配置摘要
+	fmt.Println("\n📋 策略配置摘要:")
+	fmt.Printf("  • 交易对:         %s\n", getStringParam(params, "market", ""))
+	fmt.Printf("  • 每层买单价差:   %.4f%%\n", getFloatParam(params, "bid_spread", 0.001)*100)
+	fmt.Printf("  • 目标盈利率:     %.4f%%\n", getFloatParam(params, "ask_spread", 0.01)*100)
+	fmt.Printf("  • 每笔买单数量:   %.6f\n", getFloatParam(params, "order_amount", 0.1))
+	fmt.Printf("  • 挂单层数:       %d\n", getIntParam(params, "order_levels", 3))
+	fmt.Printf("  • 刷新周期:       %v\n", getDurationParam(params, "order_refresh_time", 60))
+	fmt.Printf("  • 买单最长存活:   %v\n", getDurationParam(params, "max_order_age", 300))
+
+	return &WaitMarketRunner{
+		inner:  inner,
+		params: params,
+	}, nil
 }
 
 // createPureMarketMakingStrategy 创建纯做市策略
@@ -163,9 +286,12 @@ func createPureMarketMakingStrategy(client *api.BinanceClient, params map[string
 	return strategy.NewPureMarketMakingStrategy(client, config), nil
 }
 
+// ============================================================
+// 辅助函数（原有）
+// ============================================================
+
 // testAPIConnection 测试 API 连接
 func testAPIConnection(client *api.BinanceClient) error {
-	// 尝试获取账户信息
 	_, err := client.GetAccountInfo(nil)
 	return err
 }
@@ -225,7 +351,10 @@ func waitForInterrupt(runner StrategyRunner) {
 	os.Exit(0)
 }
 
-// 参数提取辅助函数
+// ============================================================
+// 参数提取辅助函数（原有）
+// ============================================================
+
 func getStringParam(params map[string]interface{}, key, defaultValue string) string {
 	if v, ok := params[key].(string); ok {
 		return v
