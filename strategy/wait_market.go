@@ -22,22 +22,6 @@ const (
 	defaultFeeRate  = 0.001 // 默认手续费率 0.1%
 	minPollInterval = 2 * time.Second
 	extraBidStep    = 0.001 // 卖单积压超过 2× 层数时，额外追加的买单价差（0.1%）
-
-	// ATR 动态价差参数
-	atrKlineInterval = "15m" // 计算 ATR 的 K 线周期
-	atrPeriod        = 14    // ATR 周期
-	atrMultiplierMin = 0.8   // ATR 乘数下限（低波动时收窄价差）
-	atrMultiplierMax = 2.5   // ATR 乘数上限（高波动时放宽价差，保护资金）
-	atrFetchLimit    = 20    // 拉取 K 线数量（>= atrPeriod+1）
-
-	// EMA 趋势过滤参数
-	emaPeriod       = 20  // EMA 计算周期
-	emaKlineLimit   = 25  // 拉取 K 线数量（>= emaPeriod+1）
-	trendBearFactor = 1.5 // 熊市时价差放大倍数（降低买入频率）
-
-	// 卖单超时重定价参数
-	sellRepriceFactor = 0.998 // 每次重定价降低 0.2%（尽快清库存）
-	minSellMargin     = 0.001 // 重定价后的最低保本利润率（0.1%，扣费后仍不亏损）
 )
 
 // ============================================================
@@ -65,6 +49,7 @@ type exchangeInfoResp struct {
 }
 
 // loadSymbolFilters 调用 Binance /api/v3/exchangeInfo 获取交易对精度。
+// 使用标准 http 包发起无鉴权公开请求即可。
 func loadSymbolFilters(baseURL, symbol string) (*SymbolFilters, error) {
 	url := baseURL + "/api/v3/exchangeInfo?symbol=" + symbol
 	resp, err := http.Get(url) //nolint:gosec
@@ -115,7 +100,7 @@ func loadSymbolFilters(baseURL, symbol string) (*SymbolFilters, error) {
 
 // countDecimalPlaces 统计 "0.0100" 这类字符串的有效小数位数 → 2
 func countDecimalPlaces(s string) int {
-	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, "0") // "0.01000000" → "0.01"
 	dot := strings.Index(s, ".")
 	if dot < 0 {
 		return 0
@@ -123,7 +108,7 @@ func countDecimalPlaces(s string) int {
 	return len(s) - dot - 1
 }
 
-// floorToTick 向下对齐到 tick 整数倍
+// floorToTick 向下对齐到 tick 整数倍（用于买入价 / 数量，避免超出限制）
 func floorToTick(value, tick float64) float64 {
 	if tick == 0 {
 		return value
@@ -131,7 +116,7 @@ func floorToTick(value, tick float64) float64 {
 	return math.Floor(value/tick+1e-9) * tick
 }
 
-// ceilToTick 向上对齐到 tick 整数倍
+// ceilToTick 向上对齐到 tick 整数倍（用于卖出价，确保不低于盈利目标）
 func ceilToTick(value, tick float64) float64 {
 	if tick == 0 {
 		return value
@@ -150,73 +135,53 @@ func formatWithPrecision(v float64, precision int) string {
 
 // BuySlot 一个买单层的运行状态
 type BuySlot struct {
-	Layer    int
-	OrderID  int64
-	BuyPrice float64
-	Quantity float64
-	PlacedAt time.Time
+	Layer    int       // 层索引（0 = 最接近市价）
+	OrderID  int64     // 交易所订单 ID
+	BuyPrice float64   // 实际挂单买入价
+	Quantity float64   // 挂单数量
+	PlacedAt time.Time // 下单时刻（用于超时检测）
 }
 
-// SellSlot 一个卖单的运行状态
+// SellSlot 一个卖单的运行状态（由买单成交后触发）
 type SellSlot struct {
-	BuyOrderID   int64
-	OrderID      int64
-	BuyPrice     float64 // 原始买入价（含手续费成本基准）
-	SellPrice    float64 // 当前挂单卖出价
-	Quantity     float64
-	PlacedAt     time.Time // 卖单挂出时刻（用于超时重定价）
-	RepriceCount int       // 已重定价次数
+	BuyOrderID int64   // 触发本卖单的买单 ID（追踪用）
+	OrderID    int64   // 交易所卖单 ID
+	BuyPrice   float64 // 原始买入价（用于盈利计算）
+	SellPrice  float64 // 实际挂单卖出价
+	Quantity   float64 // 实际卖出量（扣除买入手续费后，对齐 stepSize）
 }
 
 // WaitMarketConfig 策略运行参数
 type WaitMarketConfig struct {
-	Market           string
-	BidSpread        float64
-	AskSpread        float64
-	OrderRefreshTime time.Duration
-	MaxOrderAge      time.Duration // 买单最长存活时间
-	MaxSellAge       time.Duration // 卖单最长存活时间（超时重定价）
-	FilledOrderDelay time.Duration
-	OrderAmount      float64
-	OrderLevels      int
-	FeeRate          float64
-	UseATR           bool // 是否启用 ATR 动态价差
-	UseTrend         bool // 是否启用趋势过滤
-	MaxReprice       int  // 卖单最大重定价次数（0=不限）
-}
-
-// pnlStats 盈亏统计
-type pnlStats struct {
-	TotalProfit    float64 // 累计毛利润（USDT）
-	TotalFees      float64 // 累计手续费（估算）
-	TotalNetProfit float64 // 累计净利润
-	FilledRounds   int     // 已完成买卖轮次
+	Market           string        // 交易对，如 "SOLUSDT"
+	BidSpread        float64       // 基础买单价差（如 0.001 = 0.1%）
+	AskSpread        float64       // 目标盈利率（如 0.01 = 1%）
+	OrderRefreshTime time.Duration // 轮询周期
+	MaxOrderAge      time.Duration // 买单最长存活时间（超时撤单重挂）
+	FilledOrderDelay time.Duration // 买单成交后，延迟多久下卖单
+	OrderAmount      float64       // 每笔买单数量（基础资产）
+	OrderLevels      int           // 挂单层数（最多同时挂 N 个买单）
+	FeeRate          float64       // 手续费率（买卖统一）
 }
 
 // WaitMarketStrategy 挂单做市策略主体
 type WaitMarketStrategy struct {
 	cfg     WaitMarketConfig
 	client  *api.BinanceClient
-	filters *SymbolFilters
+	filters *SymbolFilters // 启动时加载
 
 	mu         sync.Mutex
-	buySlots   map[int64]*BuySlot
-	sellSlots  map[int64]*SellSlot
-	usedLayers map[int]bool
-
-	// ── 优化1：动态指标缓存 ────────────────────────────────
-	lastATR        float64   // 最近计算的 ATR 值（绝对价格）
-	lastEMA        float64   // 最近计算的 EMA 值
-	lastIndicatorT time.Time // 上次指标刷新时间（避免每 tick 都拉 K 线）
-
-	// ── 优化2：盈亏追踪 ───────────────────────────────────
-	pnl pnlStats
+	buySlots   map[int64]*BuySlot  // 活跃买单，key = orderId
+	sellSlots  map[int64]*SellSlot // 活跃卖单，key = orderId
+	usedLayers map[int]bool        // 已占用层位
 }
 
 // ============================================================
 // 构造
 // ============================================================
 
+// NewWaitMarketStrategy 从参数 map 构造策略实例。
+// 精度加载在 Run() 中进行，以便日志输出有序。
 func NewWaitMarketStrategy(client *api.BinanceClient, params map[string]interface{}) (*WaitMarketStrategy, error) {
 	cfg, err := parseWaitMarketConfig(params)
 	if err != nil {
@@ -236,22 +201,24 @@ func NewWaitMarketStrategy(client *api.BinanceClient, params map[string]interfac
 // ============================================================
 
 func (s *WaitMarketStrategy) Run(ctx context.Context) error {
+	// ── 加载交易对精度 ────────────────────────────────────
 	fmt.Printf("📐 正在获取 %s 交易对精度...\n", s.cfg.Market)
 	filters, err := loadSymbolFilters(api.BaseURL, s.cfg.Market)
 	if err != nil {
 		return fmt.Errorf("获取交易对精度失败: %w", err)
 	}
 	s.filters = filters
-	fmt.Printf("✅ 价格精度: tickSize=%.8g（%d 位）  数量精度: stepSize=%.8g（%d 位）\n",
+	fmt.Printf("✅ 价格精度: tickSize=%.8g（%d 位小数）  数量精度: stepSize=%.8g（%d 位小数）\n",
 		filters.TickSize, filters.PricePrecision,
 		filters.StepSize, filters.QtyPrecision)
 
-	fmt.Println("🚀 优化版挂单做市策略启动")
+	fmt.Println("🚀 挂单做市策略启动")
 	s.printConfig()
 
 	ticker := time.NewTicker(s.cfg.OrderRefreshTime)
 	defer ticker.Stop()
 
+	// 启动时立即执行一次
 	if err := s.tick(); err != nil {
 		fmt.Printf("⚠️  首次 tick 出错: %v\n", err)
 	}
@@ -262,7 +229,6 @@ func (s *WaitMarketStrategy) Run(ctx context.Context) error {
 			fmt.Println("🛑 策略收到停止信号，正在撤销所有买单...")
 			s.cancelAllBuyOrders()
 			fmt.Println("✅ 策略已停止（卖单保留，等待自然成交）")
-			s.printPnL()
 			return nil
 		case <-ticker.C:
 			if err := s.tick(); err != nil {
@@ -273,151 +239,23 @@ func (s *WaitMarketStrategy) Run(ctx context.Context) error {
 }
 
 func (s *WaitMarketStrategy) tick() error {
-	// ── 优化3：每 5 分钟刷新一次技术指标（减少 K 线 API 频率）─
-	if s.cfg.UseATR || s.cfg.UseTrend {
-		if time.Since(s.lastIndicatorT) > 5*time.Minute {
-			s.refreshIndicators()
-		}
-	}
-
+	// 1. 同步所有订单状态（成交检测 / 超时撤单）
 	if err := s.syncOrders(); err != nil {
 		return fmt.Errorf("同步订单失败: %w", err)
 	}
 
-	// ── 优化4：使用 BookTicker（bid 价）作为参考价，更贴近成交 ─
-	bidPrice, askPrice, err := s.getBidAskPrice()
+	// 2. 获取最新价格
+	latestPrice, err := s.getLatestPrice()
 	if err != nil {
 		return fmt.Errorf("获取价格失败: %w", err)
 	}
-	midPrice := (bidPrice + askPrice) / 2
 
-	s.refillBuySlots(bidPrice, midPrice)
-	s.printStatus(midPrice)
+	// 3. 根据规则补充缺失的买单层
+	s.refillBuySlots(latestPrice)
+
+	// 4. 打印当前状态
+	s.printStatus(latestPrice)
 	return nil
-}
-
-// ============================================================
-// 优化5：动态技术指标（ATR + EMA）
-// ============================================================
-
-// refreshIndicators 刷新 ATR 和 EMA，供动态价差 / 趋势过滤使用
-func (s *WaitMarketStrategy) refreshIndicators() {
-	limit := atrFetchLimit
-	if limit < emaKlineLimit {
-		limit = emaKlineLimit
-	}
-	klines, err := s.client.GetKlines(api.GetKlinesParams{
-		Symbol:   s.cfg.Market,
-		Interval: atrKlineInterval,
-		Limit:    &limit,
-	})
-	if err != nil {
-		fmt.Printf("  ⚠️  拉取 K 线失败，跳过指标刷新: %v\n", err)
-		return
-	}
-
-	highs := make([]float64, 0, len(klines))
-	lows := make([]float64, 0, len(klines))
-	closes := make([]float64, 0, len(klines))
-	for _, k := range klines {
-		d, err := api.ParseKline(k)
-		if err != nil {
-			continue
-		}
-		h, _ := strconv.ParseFloat(d.High, 64)
-		l, _ := strconv.ParseFloat(d.Low, 64)
-		c, _ := strconv.ParseFloat(d.Close, 64)
-		highs = append(highs, h)
-		lows = append(lows, l)
-		closes = append(closes, c)
-	}
-
-	if len(closes) >= atrPeriod+1 {
-		s.lastATR = calcATR(highs, lows, closes, atrPeriod)
-	}
-	if len(closes) >= emaPeriod {
-		s.lastEMA = calcEMA(closes, emaPeriod)
-	}
-	s.lastIndicatorT = time.Now()
-
-	if s.cfg.UseATR && s.lastATR > 0 {
-		fmt.Printf("  📊 指标刷新 — ATR(14)=%.4f  EMA(%d)=%.4f\n",
-			s.lastATR, emaPeriod, s.lastEMA)
-	}
-}
-
-// calcATR 使用 Wilder 平滑法计算 ATR
-func calcATR(highs, lows, closes []float64, period int) float64 {
-	n := len(closes)
-	if n < period+1 {
-		return 0
-	}
-	trValues := make([]float64, n-1)
-	for i := 1; i < n; i++ {
-		hl := highs[i] - lows[i]
-		hc := math.Abs(highs[i] - closes[i-1])
-		lc := math.Abs(lows[i] - closes[i-1])
-		trValues[i-1] = math.Max(hl, math.Max(hc, lc))
-	}
-	// 初始 ATR = 前 period 个 TR 的均值
-	atr := 0.0
-	for i := 0; i < period; i++ {
-		atr += trValues[i]
-	}
-	atr /= float64(period)
-	// Wilder 平滑
-	for i := period; i < len(trValues); i++ {
-		atr = (atr*float64(period-1) + trValues[i]) / float64(period)
-	}
-	return atr
-}
-
-// calcEMA 计算指数移动平均
-func calcEMA(closes []float64, period int) float64 {
-	if len(closes) < period {
-		return 0
-	}
-	k := 2.0 / float64(period+1)
-	ema := closes[len(closes)-period]
-	for i := len(closes) - period + 1; i < len(closes); i++ {
-		ema = closes[i]*k + ema*(1-k)
-	}
-	return ema
-}
-
-// effectiveBidSpread 根据 ATR 和趋势动态调整买单价差
-//
-//	规则：
-//	  1. 基准价差 = cfg.BidSpread
-//	  2. ATR 启用时：atrRatio = ATR/price，normalize 到 [min,max] 乘数区间
-//	  3. 熊市（price < EMA）时：价差再乘以 trendBearFactor，降低成交概率保护资金
-func (s *WaitMarketStrategy) effectiveBidSpread(midPrice float64, sellCount int) float64 {
-	spread := s.cfg.BidSpread
-
-	// ── ATR 动态调整 ──────────────────────────────────────
-	if s.cfg.UseATR && s.lastATR > 0 && midPrice > 0 {
-		atrRatio := s.lastATR / midPrice
-		// 以配置 bidSpread 为基准：atrRatio 小则缩小，大则放大
-		baseRatio := s.cfg.BidSpread
-		multiplier := atrRatio / baseRatio
-		multiplier = math.Max(atrMultiplierMin, math.Min(atrMultiplierMax, multiplier))
-		spread = s.cfg.BidSpread * multiplier
-	}
-
-	// ── 卖单积压加深价差（原逻辑保留）────────────────────
-	maxSell := s.cfg.OrderLevels
-	if sellCount > maxSell*2 {
-		spread += extraBidStep
-	}
-
-	// ── 趋势过滤：熊市时放宽价差（买得更低）──────────────
-	if s.cfg.UseTrend && s.lastEMA > 0 && midPrice < s.lastEMA {
-		spread *= trendBearFactor
-		fmt.Printf("  🐻 价格低于 EMA(%.2f)，熊市模式，价差放宽至 %.4f%%\n",
-			s.lastEMA, spread*100)
-	}
-
-	return spread
 }
 
 // ============================================================
@@ -425,16 +263,8 @@ func (s *WaitMarketStrategy) effectiveBidSpread(midPrice float64, sellCount int)
 // ============================================================
 
 func (s *WaitMarketStrategy) syncOrders() error {
-	// ── 优化6：收集需要延迟处理的操作，锁外执行 ──────────
-	type pendingSell struct {
-		slot      *BuySlot
-		sellPrice float64
-		sellQty   float64
-		delay     time.Duration
-	}
-	var pendingSells []pendingSell
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// ── 买单检查 ──────────────────────────────────────────
 	for oid, slot := range s.buySlots {
@@ -446,21 +276,33 @@ func (s *WaitMarketStrategy) syncOrders() error {
 
 		switch status {
 		case "FILLED":
-			fmt.Printf("  ✅ 买单 %d（层%d, 价格%s）已成交\n",
+			// ── 需求1：买单成交 → 立即计算盈利价格挂卖单 ──
+			fmt.Printf("  ✅ 买单 %d（层%d, 价格%s）已成交，立即挂出卖单...\n",
 				oid, slot.Layer, s.fmtPrice(slot.BuyPrice))
 
 			sellPrice := s.calcSellPrice(slot.BuyPrice)
+			// 实际持有量：扣除买入手续费，向下对齐 stepSize
 			sellQty := s.floorQty(slot.Quantity * (1 - s.cfg.FeeRate))
 
-			// 收集待处理卖单（避免在锁内 sleep）
-			slotCopy := *slot
-			pendingSells = append(pendingSells, pendingSell{
-				slot:      &slotCopy,
-				sellPrice: sellPrice,
-				sellQty:   sellQty,
-				delay:     s.cfg.FilledOrderDelay,
-			})
+			time.Sleep(s.cfg.FilledOrderDelay)
 
+			sellOID, err := s.placeSellOrder(s.cfg.Market, sellQty, sellPrice)
+			if err != nil {
+				fmt.Printf("  ❌ 挂卖单失败: %v（持仓可能滞留，将在下次 tick 重试）\n", err)
+				// 买单层位仍然释放，避免该层卡死；卖单在下次 tick 会被重新检测
+			} else {
+				s.sellSlots[sellOID] = &SellSlot{
+					BuyOrderID: oid,
+					OrderID:    sellOID,
+					BuyPrice:   slot.BuyPrice,
+					SellPrice:  sellPrice,
+					Quantity:   sellQty,
+				}
+				fmt.Printf("  📤 卖单已挂出 %d，价格 %s，数量 %s\n",
+					sellOID, s.fmtPrice(sellPrice), s.fmtQty(sellQty))
+			}
+
+			// 无论卖单是否成功，都释放买单层位
 			delete(s.usedLayers, slot.Layer)
 			delete(s.buySlots, oid)
 
@@ -470,14 +312,17 @@ func (s *WaitMarketStrategy) syncOrders() error {
 			delete(s.buySlots, oid)
 
 		case "NEW", "PARTIALLY_FILLED":
+			// ── 需求2：超时则撤单，等待 refillBuySlots 以新价重挂 ──
 			age := time.Since(slot.PlacedAt)
 			if age > s.cfg.MaxOrderAge {
-				fmt.Printf("  ⏰ 买单 %d 存活 %.0fs 超时，撤单重挂...\n", oid, age.Seconds())
+				fmt.Printf("  ⏰ 买单 %d 存活 %.0fs 已超时，撤单并按最新价重挂...\n",
+					oid, age.Seconds())
 				if err := s.cancelOrder(s.cfg.Market, oid); err != nil {
 					fmt.Printf("  ❌ 撤单失败: %v\n", err)
 				} else {
 					delete(s.usedLayers, slot.Layer)
 					delete(s.buySlots, oid)
+					// 层位空出后，下方 refillBuySlots 会以最新价重新挂单
 				}
 			}
 		}
@@ -493,154 +338,47 @@ func (s *WaitMarketStrategy) syncOrders() error {
 
 		switch status {
 		case "FILLED":
-			// ── 优化7：精确计算含费净利润 ─────────────────
-			grossProfit := (slot.SellPrice - slot.BuyPrice) * slot.Quantity
-			buyFee := slot.BuyPrice * slot.Quantity / (1 - s.cfg.FeeRate) * s.cfg.FeeRate
-			sellFee := slot.SellPrice * slot.Quantity * s.cfg.FeeRate
-			netProfit := grossProfit - buyFee - sellFee
-
-			s.pnl.TotalProfit += grossProfit
-			s.pnl.TotalFees += buyFee + sellFee
-			s.pnl.TotalNetProfit += netProfit
-			s.pnl.FilledRounds++
-
-			fmt.Printf("  💰 卖单 %d 成交！买 %s → 卖 %s，数量 %s，净利润 %.4f USDT（累计 %.4f USDT）\n",
+			profit := (slot.SellPrice - slot.BuyPrice) * slot.Quantity
+			fmt.Printf("  💰 卖单 %d 成交！买入 %s → 卖出 %s，数量 %s，盈利 ≈%.4f USDT\n",
 				oid,
 				s.fmtPrice(slot.BuyPrice),
 				s.fmtPrice(slot.SellPrice),
 				s.fmtQty(slot.Quantity),
-				netProfit,
-				s.pnl.TotalNetProfit)
+				profit)
 			delete(s.sellSlots, oid)
 
 		case "CANCELED", "REJECTED", "EXPIRED":
-			// 异常卖单：按原价重新挂出，保证持仓不落空
-			fmt.Printf("  ⚠️  卖单 %d 状态异常: %s，重新挂出...\n", oid, status)
+			// ── 需求1：卖单异常 → 必须重新挂出，不留库存 ──
+			fmt.Printf("  ⚠️  卖单 %d 状态异常: %s，重新挂出以清除库存...\n", oid, status)
 			newOID, err := s.placeSellOrder(s.cfg.Market, slot.Quantity, slot.SellPrice)
 			if err != nil {
-				fmt.Printf("  ❌ 重新挂卖单失败: %v（下次 tick 重试）\n", err)
+				fmt.Printf("  ❌ 重新挂卖单失败: %v（将在下次 tick 再试）\n", err)
+				// 保留旧 slot 等下次 tick 重试
 			} else {
 				s.sellSlots[newOID] = &SellSlot{
-					BuyOrderID:   slot.BuyOrderID,
-					OrderID:      newOID,
-					BuyPrice:     slot.BuyPrice,
-					SellPrice:    slot.SellPrice,
-					Quantity:     slot.Quantity,
-					PlacedAt:     time.Now(),
-					RepriceCount: slot.RepriceCount,
-				}
-				delete(s.sellSlots, oid)
-			}
-
-		case "NEW":
-			// ── 优化8：卖单超时 → 动态重定价，逐步降低清仓 ─
-			if s.cfg.MaxSellAge > 0 && time.Since(slot.PlacedAt) > s.cfg.MaxSellAge {
-				if s.cfg.MaxReprice > 0 && slot.RepriceCount >= s.cfg.MaxReprice {
-					fmt.Printf("  ⚠️  卖单 %d 已重定价 %d 次达上限，保留等待成交\n",
-						oid, slot.RepriceCount)
-					continue
-				}
-
-				newSellPrice := s.calcRepricedSell(slot)
-				if newSellPrice <= 0 {
-					fmt.Printf("  🔒 卖单 %d 重定价后低于保本线，保留原价\n", oid)
-					continue
-				}
-
-				fmt.Printf("  📉 卖单 %d 超时（存活%.0fs），重定价 %s → %s（第%d次）\n",
-					oid, time.Since(slot.PlacedAt).Seconds(),
-					s.fmtPrice(slot.SellPrice), s.fmtPrice(newSellPrice),
-					slot.RepriceCount+1)
-
-				if err := s.cancelOrder(s.cfg.Market, oid); err != nil {
-					fmt.Printf("  ❌ 撤卖单失败: %v\n", err)
-					continue
-				}
-				newOID, err := s.placeSellOrder(s.cfg.Market, slot.Quantity, newSellPrice)
-				if err != nil {
-					fmt.Printf("  ❌ 重新挂卖单失败: %v\n", err)
-					// 重新挂回原价
-					origOID, _ := s.placeSellOrder(s.cfg.Market, slot.Quantity, slot.SellPrice)
-					if origOID > 0 {
-						s.sellSlots[origOID] = &SellSlot{
-							BuyOrderID:   slot.BuyOrderID,
-							OrderID:      origOID,
-							BuyPrice:     slot.BuyPrice,
-							SellPrice:    slot.SellPrice,
-							Quantity:     slot.Quantity,
-							PlacedAt:     time.Now(),
-							RepriceCount: slot.RepriceCount,
-						}
-					}
-				} else {
-					s.sellSlots[newOID] = &SellSlot{
-						BuyOrderID:   slot.BuyOrderID,
-						OrderID:      newOID,
-						BuyPrice:     slot.BuyPrice,
-						SellPrice:    newSellPrice,
-						Quantity:     slot.Quantity,
-						PlacedAt:     time.Now(),
-						RepriceCount: slot.RepriceCount + 1,
-					}
+					BuyOrderID: slot.BuyOrderID,
+					OrderID:    newOID,
+					BuyPrice:   slot.BuyPrice,
+					SellPrice:  slot.SellPrice,
+					Quantity:   slot.Quantity,
 				}
 				delete(s.sellSlots, oid)
 			}
 		}
-	}
-
-	s.mu.Unlock()
-
-	// ── 锁外执行延迟挂卖单（避免锁内 sleep 阻塞）─────────
-	for _, ps := range pendingSells {
-		if ps.delay > 0 {
-			time.Sleep(ps.delay)
-		}
-		s.mu.Lock()
-		sellOID, err := s.placeSellOrder(s.cfg.Market, ps.sellQty, ps.sellPrice)
-		if err != nil {
-			fmt.Printf("  ❌ 挂卖单失败: %v\n", err)
-		} else {
-			s.sellSlots[sellOID] = &SellSlot{
-				BuyOrderID: ps.slot.OrderID,
-				OrderID:    sellOID,
-				BuyPrice:   ps.slot.BuyPrice,
-				SellPrice:  ps.sellPrice,
-				Quantity:   ps.sellQty,
-				PlacedAt:   time.Now(),
-			}
-			fmt.Printf("  📤 卖单已挂出 %d，价格 %s，数量 %s\n",
-				sellOID, s.fmtPrice(ps.sellPrice), s.fmtQty(ps.sellQty))
-		}
-		s.mu.Unlock()
 	}
 
 	return nil
 }
 
-// calcRepricedSell 计算重定价后的卖出价，保证不低于保本线
-//
-//	保本线 = buyPrice × (1 + 2×feeRate + minSellMargin)
-func (s *WaitMarketStrategy) calcRepricedSell(slot *SellSlot) float64 {
-	newPrice := ceilToTick(slot.SellPrice*sellRepriceFactor, s.filters.TickSize)
-	// 保本线：至少覆盖双边手续费 + 最低利润
-	breakeven := ceilToTick(
-		slot.BuyPrice*(1+2*s.cfg.FeeRate+minSellMargin),
-		s.filters.TickSize,
-	)
-	if newPrice < breakeven {
-		return 0 // 触碰保本线，不再降价
-	}
-	return newPrice
-}
-
 // ============================================================
-// 补充买单（含积压保护 + 动态价差）
+// 补充买单（含积压保护逻辑）
 // ============================================================
 
-func (s *WaitMarketStrategy) refillBuySlots(bidPrice, midPrice float64) {
+func (s *WaitMarketStrategy) refillBuySlots(latestPrice float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// ── 需求4：买单数量上限 = order_levels ──────────────
 	if len(s.buySlots) >= s.cfg.OrderLevels {
 		return
 	}
@@ -648,27 +386,33 @@ func (s *WaitMarketStrategy) refillBuySlots(bidPrice, midPrice float64) {
 	sellCount := len(s.sellSlots)
 	maxSell := s.cfg.OrderLevels
 
-	// ── 卖单积压 > 3× → 暂停买入 ─────────────────────────
+	// ── 需求6：卖单积压 > 3× 层数 → 暂停所有买入 ────────
 	if sellCount > maxSell*3 {
-		fmt.Printf("  ⏸️  卖单积压 %d（> %d×3），暂停挂买单\n", sellCount, maxSell)
+		fmt.Printf("  ⏸️  卖单积压 %d 个（> %d×3），暂停挂买单，等待卖出...\n",
+			sellCount, maxSell)
 		return
 	}
 
-	// ── 优化9：动态价差（ATR + 趋势 + 积压保护）──────────
-	bidSpread := s.effectiveBidSpread(midPrice, sellCount)
+	// ── 需求5：卖单积压 > 2× 层数 → 加深价差，更低价买入 ─
+	bidSpread := s.cfg.BidSpread
+	if sellCount > maxSell*2 {
+		bidSpread += extraBidStep
+		fmt.Printf("  📉 卖单积压 %d 个（> %d×2），价差加深 %.1f%%，当前有效价差 %.4f%%\n",
+			sellCount, maxSell, extraBidStep*100, bidSpread*100)
+	}
 
+	// ── 需求3：逐层补充，直到达到 order_levels 上限 ──────
 	for layer := 0; layer < s.cfg.OrderLevels; layer++ {
 		if s.usedLayers[layer] {
-			continue
+			continue // 该层已有买单，跳过
 		}
 		if len(s.buySlots) >= s.cfg.OrderLevels {
-			break
+			break // 总数已达上限
 		}
 
-		// ── 优化10：以 bid 价为基准，避免立即被市价吃掉 ──
-		// 层0 稍低于 bid，层1/2 更深，防止大幅下跌全部成交
-		rawPrice := bidPrice * (1 - bidSpread*float64(layer+1))
-		buyPrice := s.floorPrice(rawPrice)
+		// 计算当层买入价：每深一层多偏移一档 bidSpread
+		rawPrice := latestPrice * (1 - bidSpread*float64(layer+1))
+		buyPrice := s.floorPrice(rawPrice) // 向下对齐 tickSize
 		qty := s.floorQty(s.cfg.OrderAmount)
 
 		oid, err := s.placeBuyOrder(s.cfg.Market, qty, buyPrice)
@@ -687,9 +431,8 @@ func (s *WaitMarketStrategy) refillBuySlots(bidPrice, midPrice float64) {
 		}
 		s.usedLayers[layer] = true
 
-		fmt.Printf("  📥 层%d 买单 %d 挂出，价格 %s（偏离 bid %.3f%%），数量 %s\n",
-			layer, oid, s.fmtPrice(buyPrice),
-			bidSpread*float64(layer+1)*100, s.fmtQty(qty))
+		fmt.Printf("  📥 层%d 买单 %d 已挂出，价格 %s，数量 %s\n",
+			layer, oid, s.fmtPrice(buyPrice), s.fmtQty(qty))
 	}
 }
 
@@ -697,7 +440,7 @@ func (s *WaitMarketStrategy) refillBuySlots(bidPrice, midPrice float64) {
 // 价格 / 数量精度辅助
 // ============================================================
 
-// calcSellPrice 含手续费的盈利卖出价（向上对齐 tickSize）
+// calcSellPrice 含手续费的盈利卖出价，向上对齐 tickSize
 //
 //	P_sell = P_buy × (1 + askSpread) / ((1 − feeBuy) × (1 − feeSell))
 func (s *WaitMarketStrategy) calcSellPrice(buyPrice float64) float64 {
@@ -725,19 +468,16 @@ func (s *WaitMarketStrategy) fmtQty(q float64) string {
 // API 调用封装
 // ============================================================
 
-// getBidAskPrice 使用 BookTicker 获取最优买卖价
-func (s *WaitMarketStrategy) getBidAskPrice() (bid, ask float64, err error) {
+func (s *WaitMarketStrategy) getLatestPrice() (float64, error) {
 	sym := s.cfg.Market
-	tickers, err := s.client.GetBookTicker(api.GetBookTickerParams{Symbol: &sym})
+	tickers, err := s.client.GetTickerPrice(api.GetTickerPriceParams{Symbol: &sym})
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	if len(tickers) == 0 {
-		return 0, 0, fmt.Errorf("未获取到 %s 的 BookTicker", sym)
+		return 0, fmt.Errorf("未获取到 %s 的价格", sym)
 	}
-	bid, _ = strconv.ParseFloat(tickers[0].BidPrice, 64)
-	ask, _ = strconv.ParseFloat(tickers[0].AskPrice, 64)
-	return bid, ask, nil
+	return strconv.ParseFloat(tickers[0].Price, 64)
 }
 
 func (s *WaitMarketStrategy) placeBuyOrder(symbol string, qty, price float64) (int64, error) {
@@ -795,6 +535,7 @@ func (s *WaitMarketStrategy) queryOrderStatus(symbol string, orderID int64) (str
 	return resp.Status, nil
 }
 
+// cancelAllBuyOrders 退出时撤销所有买单；卖单保留，等待自然成交
 func (s *WaitMarketStrategy) cancelAllBuyOrders() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -820,11 +561,11 @@ func parseWaitMarketConfig(p map[string]interface{}) (WaitMarketConfig, error) {
 		return cfg, fmt.Errorf("缺少必填参数 market")
 	}
 
-	cfg.BidSpread = getFloat(p, "bid_spread", 0.003) // 默认 0.3%（原 0.1% 过小）
-	cfg.AskSpread = getFloat(p, "ask_spread", 0.008) // 默认 0.8%（原 1% 可降低成交难度）
+	cfg.BidSpread = getFloat(p, "bid_spread", 0.001)
+	cfg.AskSpread = getFloat(p, "ask_spread", 0.01)
 	cfg.OrderAmount = getFloat(p, "order_amount", 0.1)
 
-	refreshSec := getInt(p, "order_refresh_time", 30) // 默认 30s（原 60s，更灵敏）
+	refreshSec := getInt(p, "order_refresh_time", 60)
 	cfg.OrderRefreshTime = time.Duration(refreshSec) * time.Second
 	if cfg.OrderRefreshTime < minPollInterval {
 		cfg.OrderRefreshTime = minPollInterval
@@ -833,26 +574,12 @@ func parseWaitMarketConfig(p map[string]interface{}) (WaitMarketConfig, error) {
 	maxAgeSec := getInt(p, "max_order_age", 300)
 	cfg.MaxOrderAge = time.Duration(maxAgeSec) * time.Second
 
-	// ── 新参数：卖单超时重定价 ────────────────────────────
-	maxSellAgeSec := getInt(p, "max_sell_age", 1800) // 默认 30 分钟无成交则重定价
-	cfg.MaxSellAge = time.Duration(maxSellAgeSec) * time.Second
-
 	delaySec := getInt(p, "filled_order_delay", 1)
 	cfg.FilledOrderDelay = time.Duration(delaySec) * time.Second
 
 	cfg.OrderLevels = getInt(p, "order_levels", 3)
 	if cfg.OrderLevels < 1 {
 		cfg.OrderLevels = 1
-	}
-
-	cfg.MaxReprice = getInt(p, "max_reprice", 5) // 卖单最多重定价 5 次
-
-	// ── 新参数：开关选项 ──────────────────────────────────
-	cfg.UseATR = getBool(p, "use_atr", true)     // 默认启用 ATR 动态价差
-	cfg.UseTrend = getBool(p, "use_trend", true) // 默认启用趋势过滤
-
-	if v, ok := p["fee_rate"].(float64); ok && v > 0 {
-		cfg.FeeRate = v
 	}
 
 	return cfg, nil
@@ -892,77 +619,65 @@ func getInt(p map[string]interface{}, key string, defaultVal int) int {
 	return defaultVal
 }
 
-func getBool(p map[string]interface{}, key string, defaultVal bool) bool {
-	v, ok := p[key]
-	if !ok {
-		return defaultVal
-	}
-	switch val := v.(type) {
-	case bool:
-		return val
-	case string:
-		return strings.ToLower(val) == "true" || val == "1"
-	}
-	return defaultVal
-}
-
 // ============================================================
-// 状态 / 盈亏打印
+// 状态打印
 // ============================================================
 
 func (s *WaitMarketStrategy) printConfig() {
 	c := s.cfg
 	f := s.filters
 	maxSell := c.OrderLevels
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Printf("  交易对:           %s\n", c.Market)
-	fmt.Printf("  价格精度:         tickSize=%.8g（%d 位）\n", f.TickSize, f.PricePrecision)
-	fmt.Printf("  数量精度:         stepSize=%.8g（%d 位）\n", f.StepSize, f.QtyPrecision)
+	fmt.Printf("  价格精度:         tickSize=%.8g（%d 位小数）\n", f.TickSize, f.PricePrecision)
+	fmt.Printf("  数量精度:         stepSize=%.8g（%d 位小数）\n", f.StepSize, f.QtyPrecision)
 	fmt.Printf("  基础买单价差:     %.4f%%\n", c.BidSpread*100)
 	fmt.Printf("  目标盈利率:       %.4f%%\n", c.AskSpread*100)
 	fmt.Printf("  每笔买单数量:     %s\n", s.fmtQty(c.OrderAmount))
-	fmt.Printf("  挂单层数:         %d\n", c.OrderLevels)
+	fmt.Printf("  挂单层数:         %d（最多同时 %d 个买单）\n", c.OrderLevels, c.OrderLevels)
 	fmt.Printf("  加深价差阈值:     卖单 > %d（%d×2）时，买单价差 +%.1f%%\n",
 		maxSell*2, maxSell, extraBidStep*100)
-	fmt.Printf("  暂停买入阈值:     卖单 > %d（%d×3）\n", maxSell*3, maxSell)
+	fmt.Printf("  暂停买入阈值:     卖单 > %d（%d×3）时，暂停下买单\n",
+		maxSell*3, maxSell)
 	fmt.Printf("  买单最长存活:     %s\n", c.MaxOrderAge)
-	fmt.Printf("  卖单超时重定价:   %s（最多 %d 次，降幅 %.1f%%/次，保本线 +%.1f%%）\n",
-		c.MaxSellAge, c.MaxReprice,
-		(1-sellRepriceFactor)*100, minSellMargin*100)
 	fmt.Printf("  刷新周期:         %s\n", c.OrderRefreshTime)
-	fmt.Printf("  ATR 动态价差:     %v  趋势过滤: %v\n", c.UseATR, c.UseTrend)
+	fmt.Printf("  成交后延迟:       %s\n", c.FilledOrderDelay)
 	fmt.Printf("  手续费率:         %.4f%%\n", c.FeeRate*100)
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
-func (s *WaitMarketStrategy) printStatus(midPrice float64) {
+func (s *WaitMarketStrategy) printStatus(latestPrice float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	sellCount := len(s.sellSlots)
 	maxSell := s.cfg.OrderLevels
 
-	effectiveSpread := s.effectiveBidSpread(midPrice, sellCount)
+	// 计算当前有效价差（与 refillBuySlots 中逻辑保持一致）
+	effectiveSpread := s.cfg.BidSpread
+	if sellCount > maxSell*2 {
+		effectiveSpread += extraBidStep
+	}
 
+	// 买入状态标签
 	buyState := "正常"
 	switch {
 	case sellCount > maxSell*3:
 		buyState = "⏸️ 暂停（卖单积压 > 3×）"
 	case sellCount > maxSell*2:
 		buyState = fmt.Sprintf("📉 加深价差（%.4f%%）", effectiveSpread*100)
-	case s.cfg.UseTrend && s.lastEMA > 0 && midPrice < s.lastEMA:
-		buyState = fmt.Sprintf("🐻 熊市防御（EMA=%.4f）", s.lastEMA)
 	}
 
-	fmt.Printf("\n[%s] 中间价: %s  买单: %d/%d  卖单: %d  状态: %s\n",
+	fmt.Printf("\n[%s] 最新价: %s  买单: %d/%d  卖单: %d  买入状态: %s\n",
 		time.Now().Format("15:04:05"),
-		s.fmtPrice(midPrice),
+		s.fmtPrice(latestPrice),
 		len(s.buySlots), s.cfg.OrderLevels,
-		sellCount, buyState,
+		sellCount,
+		buyState,
 	)
 
 	if len(s.buySlots) > 0 {
-		fmt.Println("  📥 买单:")
+		fmt.Println("  📥 买单列表:")
 		for _, slot := range s.buySlots {
 			age := time.Since(slot.PlacedAt).Round(time.Second)
 			remaining := s.cfg.MaxOrderAge - time.Since(slot.PlacedAt)
@@ -971,47 +686,29 @@ func (s *WaitMarketStrategy) printStatus(midPrice float64) {
 			}
 			fmt.Printf("     层%-2d  ID:%-12d  价格:%-12s  存活:%-8s  剩余:%s\n",
 				slot.Layer, slot.OrderID,
-				s.fmtPrice(slot.BuyPrice), age, remaining.Round(time.Second))
+				s.fmtPrice(slot.BuyPrice),
+				age, remaining.Round(time.Second))
 		}
 	}
 
 	if sellCount > 0 {
-		fmt.Printf("  📤 卖单（%d 个）:\n", sellCount)
+		fmt.Printf("  📤 卖单列表（%d 个）:\n", sellCount)
 		for _, slot := range s.sellSlots {
-			age := time.Since(slot.PlacedAt).Round(time.Second)
-			repriceInfo := ""
-			if slot.RepriceCount > 0 {
-				repriceInfo = fmt.Sprintf("  ↘已降价%d次", slot.RepriceCount)
-			}
-			fmt.Printf("     ID:%-12d  买入:%-12s  卖出:%-12s  数量:%-10s  存活:%s%s\n",
+			fmt.Printf("     ID:%-12d  买入:%-12s  卖出:%-12s  数量:%-10s\n",
 				slot.OrderID,
 				s.fmtPrice(slot.BuyPrice),
 				s.fmtPrice(slot.SellPrice),
-				s.fmtQty(slot.Quantity),
-				age, repriceInfo)
+				s.fmtQty(slot.Quantity))
 		}
 
+		// 积压警告
 		switch {
 		case sellCount > maxSell*3:
-			fmt.Printf("  🚨 卖单积压严重（%d > %d×3），已暂停挂买单！\n",
+			fmt.Printf("  🚨 卖单积压严重（%d > %d×3=%d），已暂停挂买单！\n",
 				sellCount, maxSell, maxSell*3)
 		case sellCount > maxSell*2:
-			fmt.Printf("  ⚠️  卖单积压（%d > %d×2），价差加深至 %.4f%%\n",
-				sellCount, maxSell*2, effectiveSpread*100)
+			fmt.Printf("  ⚠️  卖单积压（%d > %d×2=%d），买单价差已加深至 %.4f%%\n",
+				sellCount, maxSell, maxSell*2, effectiveSpread*100)
 		}
 	}
-
-	// ── 优化11：每 10 轮打印一次盈亏摘要 ─────────────────
-	if s.pnl.FilledRounds > 0 && s.pnl.FilledRounds%10 == 0 {
-		s.printPnL()
-	}
-}
-
-func (s *WaitMarketStrategy) printPnL() {
-	fmt.Println("\n  ════════════ 盈亏统计 ════════════")
-	fmt.Printf("  已完成轮次:  %d\n", s.pnl.FilledRounds)
-	fmt.Printf("  毛利润:      %.6f USDT\n", s.pnl.TotalProfit)
-	fmt.Printf("  手续费(估):  %.6f USDT\n", s.pnl.TotalFees)
-	fmt.Printf("  净利润:      %.6f USDT\n", s.pnl.TotalNetProfit)
-	fmt.Println("  ══════════════════════════════════")
 }
